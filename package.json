@@ -1,0 +1,17 @@
+{
+  "name": "claude-usage-buddy",
+  "version": "1.0.0",
+  "description": "Desktop widget showing Claude 5-hour and weekly usage with an animated pixel pet",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "demo": "electron . --demo",
+    "setup": "node setup.js"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11"
+  },
+  "allowScripts": {
+    "electron@33.4.11": true
+  }
+}

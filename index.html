@@ -1,0 +1,897 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'">
+<title>Claude Usage Buddy</title>
+<style>
+  html, body { margin: 0; background: transparent; overflow: hidden; user-select: none; }
+  body { font-family: 'Cascadia Mono', 'Cascadia Code', Consolas, monospace; color: #e9e6ff; }
+  #panel {
+    position: absolute; inset: 8px; box-sizing: border-box; border-radius: 14px;
+    background: linear-gradient(160deg, #181b3e, #0e0f24);
+    border: 1px solid #3d3a66;
+    box-shadow: 0 4px 12px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.07);
+    display: flex; align-items: center; gap: 12px; padding: 8px 14px 8px 8px;
+    -webkit-app-region: drag;
+  }
+  #stage { flex: none; width: 216px; height: 96px; border-radius: 9px; overflow: hidden;
+    background: #0d0e28; border: 1px solid #2a2a58; }
+  #pet { display: block; width: 216px; height: 96px; image-rendering: pixelated;
+    cursor: pointer; -webkit-app-region: no-drag; }
+  #meters { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; }
+  .lbl { font-size: 10px; letter-spacing: 1.5px; color: #9a94c9; }
+  .pct { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .bar { display: flex; gap: 2px; margin: 3px 0 2px; }
+  .bar i { flex: 1; height: 8px; border-radius: 1px; background: #262244; }
+  .sub { font-size: 9.5px; color: #746fa3; white-space: nowrap; }
+  #foot { font-size: 9px; color: #5d5887; display: flex; align-items: center; gap: 5px; -webkit-app-region: no-drag; }
+  #foot[title]:not([title=""]) { cursor: help; }
+  #dot { flex: none; width: 5px; height: 5px; border-radius: 50%; background: #5d5887; }
+  #status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <div id="stage"><canvas id="pet" width="72" height="32" title="The Avalon guardian, Clawd and the iron guard. Click any of them, right-click for options."></canvas></div>
+  <div id="meters">
+    <div class="meter" id="m5">
+      <div class="row"><span class="lbl">5H SESSION</span><span class="pct">--</span></div>
+      <div class="bar"></div><div class="sub">&nbsp;</div>
+    </div>
+    <div class="meter" id="m7">
+      <div class="row"><span class="lbl">WEEK</span><span class="pct">--</span></div>
+      <div class="bar"></div><div class="sub">&nbsp;</div>
+    </div>
+    <div id="foot"><span id="dot"></span><span id="status">waiting for Claude Code</span></div>
+  </div>
+</div>
+<script>
+// ---------- usage state ----------
+const SEGS = 16, STALE_MS = 15 * 60 * 1000;
+const COL = { ok: '#7ee0c3', warn: '#ffc857', hot: '#ff6b6b' };
+let usage = null;                 // { five_hour, seven_day, updated_at, source }
+let prev = { five: null, week: null };
+
+document.querySelectorAll('.bar').forEach(b => { for (let i = 0; i < SEGS; i++) b.appendChild(document.createElement('i')); });
+
+// A window whose reset time has passed counts as empty again.
+function eff(w) {
+  if (!w || w.used_percentage == null) return null;
+  if (w.resets_at && w.resets_at * 1000 <= Date.now()) return 0;
+  return Math.max(0, Math.min(100, w.used_percentage));
+}
+function level(p, warn, hot) { return p >= hot ? 'hot' : p >= warn ? 'warn' : 'ok'; }
+function until(w) {
+  if (!w || !w.resets_at) return '&nbsp;';
+  let s = w.resets_at - Date.now() / 1000;
+  if (s <= 0) return 'window reset';
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return 'resets in ' + (d ? d + 'd ' + h + 'h' : h ? h + 'h ' + m + 'm' : Math.max(1, m) + 'm');
+}
+function paint(id, p, w, warn, hot) {
+  const el = document.getElementById(id), segs = el.querySelectorAll('.bar i');
+  const col = p == null ? null : COL[level(p, warn, hot)];
+  el.querySelector('.pct').textContent = p == null ? '--' : Math.round(p) + '%';
+  el.querySelector('.pct').style.color = col || '#5d5887';
+  segs.forEach((s, i) => {
+    const lo = i / SEGS * 100, hi = (i + 1) / SEGS * 100;
+    s.style.background = p != null && p > lo ? col : '#262244';
+    s.style.opacity = p != null && p > lo && p < hi ? .45 : 1;
+  });
+  el.querySelector('.sub').innerHTML = until(w);
+}
+function ago(ms) {
+  const m = Math.floor(ms / 60000);
+  return m < 1 ? 'just now' : m < 60 ? m + 'm ago' : Math.floor(m / 60) + 'h ago';
+}
+function isStale() { return !usage || (usage.source !== 'demo' && Date.now() - usage.updated_at > STALE_MS); }
+
+// Why there are no (fresh) numbers: [footer text, hover explanation, dot colour]. Sent by main.js.
+let diag = null;
+const TERMINAL = 'The numbers come from Claude Code\'s status line, which runs after each reply in Claude Code in a terminal. ' +
+  'The Claude desktop app never runs it. Send a message in terminal Claude Code, or turn on live polling (right-click).';
+function why() {
+  if (!diag) return null;
+  if (diag.live) {
+    const e = diag.liveErr;
+    if (!e) return usage ? null : ['live: checking…', 'Asking Anthropic for your usage.', '#5d5887'];
+    if (e === 'no-login') return ['live: no terminal login', 'Live polling reads the login that Claude Code saves in ~/.claude/.credentials.json ' +
+      'when you sign in from a terminal. The Claude desktop app keeps its own login, so there is nothing to read. Run `claude` in a terminal and log in once.', COL.warn];
+    if (e === 'expired') return ['live: login expired', 'The saved login has expired. Open Claude Code in a terminal once to renew it; ' +
+      'the widget retries every 5 minutes.', COL.warn];
+    if (e === 'offline') return ['live: offline', 'Could not reach api.anthropic.com. Retrying every 5 minutes.', COL.warn];
+    return ['live: ' + e.replace('http-', 'HTTP '), 'The usage endpoint is unofficial and answered with an error (' + e + '). Retrying every 5 minutes.', COL.warn];
+  }
+  if (diag.setup === false) return ['not set up · npm run setup', 'Claude Code\'s status line isn\'t pointing at statusline.js. ' +
+    'Run `npm run setup` in the widget folder, then restart Claude Code.', COL.warn];
+  return usage ? null : ['needs terminal Claude Code', TERMINAL, '#5d5887'];
+}
+
+function refresh() {
+  const five = usage ? eff(usage.five_hour) : null, week = usage ? eff(usage.seven_day) : null;
+  paint('m5', five, usage && usage.five_hour, 60, 80);
+  paint('m7', week, usage && usage.seven_day, 70, 90);
+  // pet reactions to changes
+  if (prev.five != null && five != null) {
+    if (prev.five - five >= 20) react('party');
+    else if (five - prev.five >= 1) react('munch');
+  } else if (prev.week != null && week != null && week - prev.week >= 1) react('munch');
+  prev = { five, week };
+  const st = document.getElementById('status'), dot = document.getElementById('dot'), foot = document.getElementById('foot');
+  const w = why();
+  if (!usage) {
+    st.textContent = w ? w[0] : 'waiting for Claude Code';
+    dot.style.background = w ? w[2] : '#5d5887';
+    foot.title = w ? w[1] : '';
+  } else {
+    const stale = isStale(), src = usage.source === 'demo' ? 'demo' : usage.source === 'live' ? 'live' : 'claude code';
+    if (stale && w) {                          // old numbers and we know why: say so
+      st.textContent = w[0] + ' · ' + ago(Date.now() - usage.updated_at);
+      dot.style.background = w[2]; foot.title = w[1];
+    } else {
+      st.textContent = src + ' · ' + (stale ? 'idle, ' : '') + ago(Date.now() - usage.updated_at);
+      dot.style.background = stale ? '#5d5887' : COL.ok;
+      foot.title = stale && src === 'claude code' ? 'No reply in terminal Claude Code for a while. ' +
+        'Usage from the Claude desktop app or claude.ai only shows up after your next terminal reply, or with live polling.' : '';
+    }
+  }
+}
+// 0 calm, 1 alert (a sentry is posted), 2 siege, 3 heavy siege, 4 a limit is hit
+function threat() {
+  if (!usage) return 0;
+  const five = eff(usage.five_hour) || 0, week = eff(usage.seven_day) || 0;
+  if (five >= 100 || week >= 100) return 4;
+  if (five >= 90 || week >= 95) return 3;
+  if (five >= 80 || week >= 90) return 2;
+  if (five >= 60 || week >= 75) return 1;
+  return 0;
+}
+function mood() {
+  if (!usage) return 'sleep';
+  const th = threat();
+  if (th >= 4) return 'ko';
+  if (th >= 2) return 'siege';
+  if (isStale()) return 'sleep';
+  return 'ok';
+}
+
+// ---------- the scene: Avalon guardian, Clawd and the iron guard (pixel sprites drawn in code) ----------
+const cv = document.getElementById('pet'), c = cv.getContext('2d');
+const W = cv.width, H = cv.height;   // 72 x 32, shown at 3x
+// guardian: 18 x 10 body grid; legs, cape, shield and sword are drawn separately
+const SPR = [
+  '.......LGGG.......',
+  '.......GGGD.......',
+  '...LG..GGGD..GD...',
+  '..LGGGGGGGGGGGGD..',
+  '..GVVVVVVVVVVVVD..',
+  '..GVVVVVVVVVVVVD..',
+  'LGGVVVVVVVVVVVVDGD',
+  'LGGVVVVVVVVVVVVDGD',
+  'LGGVVVVVVVVVVVVDGD',
+  'LGDDDDDDDDDDDDDDGD'
+];
+const C = { L: '#f7dc84', G: '#e6bd4e', D: '#b2892c', V: '#141230', legO: '#efcd68', legI: '#a47d29',
+  cape: '#2c4196', capeD: '#22327a', blade: '#f2f8ff', edge: '#9fd3ff', grip: '#7a5520',
+  navy: '#1b1a45', cyan: '#62e6f0' };
+const EYE = { ok: '#6fdca0', warn: '#ffc857', hot: '#ff6b6b' };
+const SHIELD = ['YYYYY', 'YNYNY', 'YYCYY', '.YNY.', '..Y..'];
+// Clawd: 10 x 6 body, 2px arms each side, four 1px legs (14 x 8 overall)
+const CL = { L: '#f0a283', O: '#d97757', D: '#ad5638', eye: '#1c120f' };
+// iron soldiers: the guardian's design in plain steel with no cape (12 x 7 body + 2px legs), behind the heroes
+const SOL = [
+  '.....LG.....',
+  '..L..GD..D..',
+  '.LGGGGGGGGD.',
+  '.GVVVVVVVVD.',
+  'LGVVVVVVVVDD',
+  'LGVVVVVVVVDD',
+  'LGDDDDDDDDDD'
+];
+const BUCK = ['.LG.', 'LBBD', 'GBBD', '.GD.'];
+const IR = { L: '#d3d9e3', G: '#98a1b1', D: '#5f6779', V: '#141230', B: '#2c4196', eye: '#9fd3ff', wood: '#6b4a1c', tip: '#eef2f8' };
+const GX = [5, 30];                        // guardian patrol range, leaves room for Clawd on its right
+const PAL_GAP = 24;                        // Clawd's usual spot, clear of the sword
+const STATION = { siege: 34, sleep: 26 };  // where the guardian takes up position
+const POSTS = { siege: [6, 19], siege3: [6, 19, 57], sleep: [6] };   // where soldiers stand
+
+let f = 0, nextId = 0, shields = [];       // shields: whatever stops limit bolts this frame
+const pet = { x: 12, dir: 1, act: 'idle', t: 0, len: 0, target: 12, wait: 30, hit: 0, box: null };
+const pal = { x: 36, off: 0, act: 'idle', t: 0, len: 0, wait: 40, moving: false, yay: 0, flinch: 0, want: 36, box: null };
+const squad = [], bolts = [], sparks = [];
+
+function px(x, y, w, h, col) { c.fillStyle = col; c.fillRect(Math.round(x), Math.round(y), w, h); }
+const rnd = n => Math.random() * n | 0;
+const inBox = (b, x, y) => b && x >= b[0] && x < b[0] + b[2] && y >= b[1] && y < b[1] + b[3];
+function react(act) {
+  const len = { munch: 30, party: 46, wave: 24, hop: 12, look: 24, train: 36 }[act];
+  pet.act = act; pet.t = 0; pet.len = len;
+}
+function palReact(act) {
+  const len = { peek: 26, hop: 12, code: 46, juggle: 48, dance: 40, bubble: 52, firefly: 70, ride: 130 + rnd(90) }[act];
+  pal.act = act; pal.t = 0; pal.len = len;
+}
+cv.addEventListener('click', e => {
+  const x = e.offsetX * W / cv.clientWidth, y = e.offsetY * H / cv.clientHeight;
+  if (inBox(pal.box, x, y)) { pal.yay = 22; return; }
+  if (inBox(pet.box, x, y)) { react('wave'); return; }
+  const s = squad.find(s => inBox(s.box, x, y));
+  if (s) s.salute = 20; else react('wave');
+});
+cv.addEventListener('contextmenu', e => { e.preventDefault(); if (window.widget) window.widget.menu(); });
+
+// ---------- the world: sky by time of day, weather, and random events ----------
+const DEMO = new URLSearchParams(location.search).has('demo') || !window.widget;
+const SKY = {   // top, middle, horizon, star brightness
+  night: ['#0d0e28', '#13153a', '#1c1d4a', 1], dawn: ['#2c2a5e', '#7b4f86', '#e48d6c', .25],
+  day: ['#3b63ad', '#5b86cf', '#93b6e6', 0], dusk: ['#2a2154', '#8c4c74', '#ea9460', .25] };
+const GROUND = { night: ['#15163a', '#22245a'], dawn: ['#2a2a48', '#4a4060'], day: ['#2d5a3c', '#4f8a4c'], dusk: ['#2a2444', '#4a3a58'] };
+const KEYS = [[0, 'night'], [5, 'night'], [6.5, 'dawn'], [8, 'day'], [17, 'day'], [18.5, 'dusk'], [20, 'night'], [24.01, 'night']];
+const DRAGON = [[
+  '......ww......',
+  '.D...wwww.....',
+  'DeDDDDDDDDDD..',
+  '.DDDDDDDDDDDDD',
+  '...D.....D....'
+], [
+  '..............',
+  '.D............',
+  'DeDDDDDDDDDD..',
+  '.DDDDDDDDDDDDD',
+  '...DwwwwwD....',
+  '.....www......'
+]];
+const SL = { L: '#b6f5a8', G: '#6fdc7a', D: '#3f9a52', eye: '#14241a' };
+const EVENTS = { ok: ['quake', 'meteors', 'slimes', 'dragon'], sleep: ['quake', 'meteors', 'dragon'] };
+let weather = 'clear', weatherIn = DEMO ? 300 : 3000 + rnd(3000), ev = null, nextEv = DEMO ? 100 : 1800 + rnd(2400);
+
+const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+function mix(a, b, k) { const A = hex(a), B = hex(b); return '#' + A.map((v, i) => Math.round(v + (B[i] - v) * k).toString(16).padStart(2, '0')).join(''); }
+function hourNow() { if (DEMO) return (6 + f / 30) % 24; const d = new Date(); return d.getHours() + d.getMinutes() / 60; }
+function skyAt(h) {
+  let i = 0; while (h > KEYS[i + 1][0]) i++;
+  const [h0, a] = KEYS[i], [h1, b] = KEYS[i + 1], k = (h - h0) / (h1 - h0);
+  return { top: mix(SKY[a][0], SKY[b][0], k), mid: mix(SKY[a][1], SKY[b][1], k), bot: mix(SKY[a][2], SKY[b][2], k),
+    stars: SKY[a][3] + (SKY[b][3] - SKY[a][3]) * k, floor: mix(GROUND[a][0], GROUND[b][0], k), edge: mix(GROUND[a][1], GROUND[b][1], k) };
+}
+
+// Random events happen only while things are calm (or everyone's asleep); real usage changes end them.
+function startEvent(type) {
+  const m = mood(), pool = EVENTS[m];
+  if (!pool || pet.act === 'party') return;
+  type = pool.includes(type) ? type : pool[rnd(pool.length)];
+  ev = { type, m, t: 0, len: { quake: 70, meteors: 100, slimes: 360, dragon: 120 }[type], bash: 0, won: 0, boom: 0, bx: 0, met: [], slimes: [] };
+  if (type === 'slimes') {
+    for (let i = 0; i < 3; i++) ev.slimes.push({ x: -8 - i * 12, t: i * 5, y: 0, ko: 0, vx: 0, vy: 0, gone: false });
+    if (pet.act === 'idle' && pet.x !== 26) { pet.target = 26; pet.dir = pet.x < 26 ? 1 : -1; pet.act = 'walk'; pet.t = 0; }   // steps up to meet them
+  }
+}
+function stepWorld(m) {
+  if (--weatherIn <= 0) {
+    const r = Math.random(), winter = [11, 0, 1].includes(new Date().getMonth());
+    weather = r < .6 ? 'clear' : r < (winter ? .72 : .88) ? 'rain' : 'snow';
+    weatherIn = DEMO ? 400 + rnd(300) : 4000 + rnd(5000);
+  }
+  if (!ev) { if (EVENTS[m] && --nextEv <= 0) { startEvent(); nextEv = DEMO ? 150 + rnd(150) : 1800 + rnd(2400); } return; }
+  if (m !== ev.m) { ev = null; return; }
+  ev.t++; if (ev.bash) ev.bash--; if (ev.boom) ev.boom--;
+  if (ev.type === 'meteors') {                 // a shower, then one big one lands beyond the hills
+    if (ev.t < 60 && ev.t % 4 === 0) ev.met.push({ x: 24 + rnd(W), y: -2, big: false });
+    if (ev.t === 62) ev.met.push({ x: W + 14, y: -3, big: true });   // lands far off to the right
+    for (let i = ev.met.length - 1; i >= 0; i--) {
+      const mt = ev.met[i]; mt.x -= mt.big ? 1.3 : 1.6; mt.y += mt.big ? 1.1 : .9;
+      if (mt.big && mt.y >= 21) {
+        ev.boom = 14; ev.bx = mt.x; ev.met.splice(i, 1);
+        for (let k = 0; k < 8; k++) sparks.push({ x: mt.x, y: 21, vx: (Math.random() - .5) * 2, vy: -Math.random() * 2, life: 8 + rnd(6), col: k % 2 ? '#ffb070' : '#ffe39a' });
+      } else if (!mt.big && (mt.y > 18 || mt.x < -6)) ev.met.splice(i, 1);
+    }
+  } else if (ev.type === 'quake') {            // the ground shakes and rocks tumble down
+    if (ev.t < 55 && ev.t % 5 === 0) ev.met.push({ x: rnd(W), y: -2, vy: 0 });
+    for (let i = ev.met.length - 1; i >= 0; i--) {
+      const r = ev.met[i]; r.vy += .25; r.y += r.vy;
+      if (r.y >= 27) {
+        ev.met.splice(i, 1);
+        for (let k = 0; k < 3; k++) sparks.push({ x: r.x, y: 28, vx: (Math.random() - .5) * 1.4, vy: -Math.random(), life: 5 + rnd(4), col: '#8a7f98' });
+      }
+    }
+  } else if (ev.type === 'dragon') {           // flies over and breathes a little fire
+    if (ev.t >= 50 && ev.t < 64) {
+      const dx = W + 4 - ev.t * .85, dy = 5 + Math.sin(ev.t / 7) * 1.5;
+      sparks.push({ x: dx - 1, y: dy + 3, vx: -.6 - Math.random() * .6, vy: Math.random() * .4, life: 7 + rnd(5), col: ['#ffd166', '#ff8a4a', '#ff5a3a'][rnd(3)] });
+    }
+  } else if (ev.type === 'slimes') {           // slimes hop in from the left; the guardian bashes them away
+    for (const s of ev.slimes) {
+      if (s.gone) continue;
+      s.t++;
+      if (s.ko) {
+        s.x += s.vx; s.y += s.vy; s.vy += .35;
+        if (--s.ko === 0) {
+          s.gone = true;
+          for (let k = 0; k < 6; k++) sparks.push({ x: s.x + 2, y: 26 + s.y, vx: (Math.random() - .5) * 1.6, vy: -Math.random() * 1.5, life: 6 + rnd(5), col: k % 2 ? SL.G : SL.L });
+        }
+        continue;
+      }
+      if (s.t % 3 === 0) s.x++;
+      s.y = -Math.abs(Math.sin(s.t / 5)) * 3;
+      if (s.x + 5 >= pet.x - 7 && !ev.bash) { ev.bash = 8; s.ko = 10; s.vx = -1.3; s.vy = -2.2; }
+    }
+    if (!ev.won && ev.slimes.every(s => s.gone)) { ev.won = 1; react('wave'); pal.yay = 22; ev.len = ev.t + 30; }
+  }
+  if (ev && ev.t >= ev.len) ev = null;
+}
+
+function drawWorld(m) {
+  const h = hourNow(), s = skyAt(h), wet = weather !== 'clear';
+  for (let y = 0; y < 29; y++) {
+    const k = y / 28, col = k < .5 ? mix(s.top, s.mid, k * 2) : mix(s.mid, s.bot, (k - .5) * 2);
+    px(0, y, W, 1, wet ? mix(col, '#2e3148', .5) : col);
+  }
+  if (s.stars > .05 && !wet) {
+    c.globalAlpha = s.stars;
+    for (let i = 0; i < 13; i++) {
+      const sx = (i * 17 + 5) % W, sy = (i * 7 + 3) % 18;
+      if ((f + i * 9) % 50 > 6) px(sx, sy, 1, 1, '#33336e');
+    }
+    if (s.stars > .5 && m !== 'siege') [[4, 6], [67, 4], [46, 8], [22, 2]].forEach(([sx, sy], i) =>   // gold for the guardian, coral for Clawd
+      sparkle(sx, sy, (f + i * 17) % 48, i % 2 ? '#e8916f' : '#f1d38a'));
+    c.globalAlpha = 1;
+  }
+  if (!wet) {                                  // sun by day, crescent moon by night
+    const day = h >= 6 && h < 18.5, p = day ? (h - 6) / 12.5 : ((h - 18.5 + 24) % 24) / 11.5;
+    const bx = 3 + p * (W - 10), by = 10 - Math.sin(p * Math.PI) * 8, col = day ? '#ffe39a' : '#e6e3ff';
+    c.globalAlpha = .18; px(bx, by - 1, 4, 6, col); px(bx - 1, by, 6, 4, col); c.globalAlpha = 1;
+    px(bx + 1, by, 2, 1, col); px(bx, by + 1, 4, 2, col); px(bx + 1, by + 3, 2, 1, col);
+    if (!day) px(bx + 2, by + 1, 2, 2, mix(s.top, s.mid, .3));
+  }
+  for (let i = 0; i < (wet ? 4 : 2); i++) {    // drifting clouds
+    const qx = (f * .04 + i * 23) % (W + 16) - 12, qy = 3 + (i * 5) % 7, col = wet ? '#4a4d68' : '#f2f4ff';
+    c.globalAlpha = wet ? .8 : s.stars > .5 ? .2 : .55;
+    px(qx, qy + 1, 11, 2, col); px(qx + 2, qy, 6, 1, col); px(qx + 3, qy + 3, 6, 1, col);
+    c.globalAlpha = 1;
+  }
+  if (ev && ev.type === 'meteors') for (const mt of ev.met) {
+    const tl = mt.big ? 6 : 3, sz = mt.big ? 2 : 1;
+    for (let k = tl; k >= 0; k--) {
+      c.globalAlpha = 1 - k / (tl + 1);
+      px(mt.x + k * (mt.big ? 2.2 : 1.6), mt.y - k * .9, k < 2 ? sz : 1, k < 2 ? sz : 1, k ? '#ffd6a0' : '#ffffff');
+    }
+    c.globalAlpha = 1;
+  }
+  // distant hills, with the meteor's glow behind the far ridge
+  const far = mix(s.bot, '#0b0c20', .5), near = mix(s.bot, '#0b0c20', .7);
+  if (ev && ev.boom) {
+    c.globalAlpha = ev.boom / 20; px(ev.bx - 4, 19, 9, 4, '#ffb070'); px(ev.bx - 2, 17, 5, 2, '#ffe39a'); px(ev.bx - 1, 15, 3, 2, '#ffe39a'); c.globalAlpha = 1;
+  }
+  for (let x = 0; x < W; x++) { const hf = 21 + Math.round(Math.sin(x / 9) * 1.5 + Math.sin(x / 4.3 + 1)); px(x, hf, 1, 29 - hf, far); }
+  for (let x = 0; x < W; x++) { const hn = 25 + Math.round(Math.sin(x / 6 + 2) * 1.2 + Math.sin(x / 2.7) * .6); px(x, hn, 1, 29 - hn, near); }
+  px(0, 29, W, 3, s.floor); px(0, 29, W, 1, s.edge);
+  if (ev && ev.type === 'quake') for (const r of ev.met) px(r.x, r.y, 2, 2, '#7a7088');
+  if (ev && ev.type === 'dragon') {
+    const dx = W + 4 - ev.t * .85, dy = 5 + Math.sin(ev.t / 7) * 1.5;
+    DRAGON[(ev.t / 5 | 0) % 2].forEach((r, ry) => { for (let i = 0; i < r.length; i++) {
+      const ch = r[i]; if (ch !== '.') px(dx + i, dy + ry, 1, 1, ch === 'e' ? '#ff6b6b' : ch === 'w' ? '#7a52a0' : '#4e2c6c'); } });
+    c.globalAlpha = .25; px(dx + 1, 29, 12, 1, '#000000'); c.globalAlpha = 1;
+  }
+}
+
+function drawSlime(s) {
+  if (s.gone) return;
+  const land = !s.ko && s.y > -.6, x = s.x, bot = 28 + Math.round(s.y);
+  if (!s.ko) { c.globalAlpha = .3; px(x, 29, 5, 1, '#000000'); c.globalAlpha = 1; }
+  if (land) { px(x, bot - 2, 5, 1, SL.L); px(x - 1, bot - 1, 7, 1, SL.G); px(x - 1, bot, 7, 1, SL.D); px(x + 1, bot - 1, 1, 1, SL.eye); px(x + 3, bot - 1, 1, 1, SL.eye); }
+  else { px(x + 1, bot - 3, 3, 1, SL.L); px(x, bot - 2, 5, 2, SL.G); px(x, bot, 5, 1, SL.D); px(x + 1, bot - 2, 1, 1, SL.eye); px(x + 3, bot - 2, 1, 1, SL.eye); }
+}
+
+function step() {
+  f++; pet.t++; if (pet.hit) pet.hit--;
+  const m = mood(), th = threat();
+  const oneShot = ['munch', 'party', 'wave', 'hop', 'look', 'train'].includes(pet.act);
+  if (oneShot) { if (pet.t >= pet.len) { pet.act = 'idle'; pet.t = 0; pet.wait = 20; } }
+  else if (m !== 'ok') {
+    const st = STATION[m];
+    if (st != null && pet.x !== st) {           // take up position first (running, in a siege)
+      pet.target = st; pet.dir = st > pet.x ? 1 : -1; pet.act = 'walk';
+      if (m === 'siege' || f % 2 === 0) pet.x += pet.dir;
+    } else pet.act = m;
+  } else if (pet.act === 'walk') {
+    if (f % 2 === 0) pet.x += pet.dir;
+    if (pet.x === pet.target) { pet.act = 'idle'; pet.t = 0; pet.wait = 25 + rnd(50); }
+  } else {
+    pet.act = 'idle';
+    if (pet.t > pet.wait && !ev) {             // stands his ground during events
+      const r = Math.random();
+      if (r < .45) { pet.target = GX[0] + rnd(GX[1] - GX[0] + 1); if (pet.target !== pet.x) { pet.dir = pet.target > pet.x ? 1 : -1; pet.act = 'walk'; pet.t = 0; } }
+      else if (r < .63) react('look');
+      else if (r < .75) react('hop');
+      else if (r < .87) react('train');
+      else { pet.t = 0; pet.wait = 30 + rnd(40); }
+    }
+  }
+  stepWorld(m);
+  stepPal(m);
+  stepSquad(m, th);
+  draw(m, th);
+}
+
+// Clawd tags along to the guardian's right, scuttling sideways like the crab it is
+function stepPal(m) {
+  pal.t++; if (pal.yay) pal.yay--; if (pal.flinch) pal.flinch--;
+  const calm = m === 'ok' && pet.act !== 'munch' && pet.act !== 'party' && !ev;
+  if (!calm && pal.len) {
+    if (pal.act === 'ride') { if ((m !== 'ok' || ev) && pal.t < pal.len - 10) pal.t = pal.len - 10; }   // hop down when the mood turns
+    else { pal.act = 'idle'; pal.len = 0; pal.t = 0; }
+  }
+  pal.want = Math.min(W - 15, pet.x + (m === 'siege' ? 21 : PAL_GAP + pal.off));   // huddles close in a siege
+  if (pal.len && pal.t >= pal.len) {
+    if (pal.act === 'ride') pal.x = pal.want;
+    pal.act = 'idle'; pal.len = 0; pal.t = 0; pal.wait = 20 + rnd(40);
+  }
+  if (pal.act === 'ride') { pal.moving = false; return; }
+  let moved = false;
+  if (pal.x < pal.want) { pal.x++; moved = true; }                                       // get out of the way at once
+  else if (pal.x > pal.want && (m === 'siege' || f % 2 === 0)) { pal.x--; moved = true; }   // follow
+  pal.moving = moved || pal.x !== pal.want;
+  if (pal.len || !calm || pal.moving) return;
+  if (pal.t > pal.wait) {
+    const r = Math.random();
+    if (r < .22) pal.off = rnd(5);
+    else if (r < .32) palReact('peek');
+    else if (r < .39) palReact('hop');
+    else if (r < .5) palReact('code');
+    else if (r < .59) palReact('juggle');
+    else if (r < .68) palReact('dance');
+    else if (r < .77) palReact('bubble');
+    else if (r < .86) palReact('firefly');
+    else if (r < .95 && pet.act !== 'hop') palReact('ride');
+    if (!pal.len) { pal.t = 0; pal.wait = 30 + rnd(50); }
+  }
+}
+
+// The iron guard turns up as usage climbs: a sentry at 60%, a shield wall at 80%, a third at 90%.
+function squadPosts(m, th) {
+  if (m === 'ko') return null;                     // everyone stays where they fell
+  if (m === 'siege') return th >= 3 ? POSTS.siege3 : POSTS.siege;
+  if (m === 'sleep') return POSTS.sleep;           // night watch
+  return th >= 1 ? ['patrol'] : [];
+}
+function stepSquad(m, th) {
+  const posts = squadPosts(m, th);
+  if (posts && pet.act !== 'party') {              // nobody leaves before the party is over
+    const here = squad.filter(s => !s.leaving);
+    here.forEach((s, i) => {
+      if (i >= posts.length) s.leaving = true;
+      else if (s.post !== posts[i]) { s.post = posts[i]; s.arrived = false; if (s.post === 'patrol') s.goal = 8 + rnd(40); }
+    });
+    for (let i = here.length; i < posts.length; i++) {
+      const p = posts[i], left = p === 'patrol' || p < W / 2;
+      squad.push({ id: nextId++, x: left ? -16 : W + 4, post: p, goal: 8 + rnd(40), arrived: false, leaving: false,
+        t: 0, wait: 0, salute: 0, hit: 0, look: 0, dir: left ? 1 : -1, moving: true, box: null });
+    }
+  }
+  for (const s of squad) {
+    s.t++; if (s.salute) s.salute--; if (s.hit) s.hit--;
+    if (m === 'ko' && !s.leaving) { s.moving = false; continue; }
+    const goal = s.leaving ? (s.x < W / 2 ? -18 : W + 6) : s.post === 'patrol' ? s.goal : s.post;
+    const every = m === 'siege' && !s.leaving ? 1 : s.post === 'patrol' && s.arrived ? 3 : 2;
+    s.moving = s.x !== goal;
+    if (s.moving) { s.dir = goal > s.x ? 1 : -1; if (f % every === 0) s.x += s.dir; s.look = 0; }
+    else if (!s.arrived) {                         // reached the post; the guardian salutes a new sentry
+      s.arrived = true; s.t = 0; s.wait = 30 + rnd(40);
+      if (m === 'ok' && pet.act === 'idle') react('wave');
+    } else if (s.post === 'patrol') {
+      if (--s.wait <= 0) { s.goal = rnd(W - 15); s.wait = 40 + rnd(60); }
+      s.look = [0, -1, 0, 1][(s.t / 14 | 0) % 4];
+    }
+  }
+  for (let i = squad.length - 1; i >= 0; i--) if (squad[i].leaving && (squad[i].x <= -18 || squad[i].x >= W + 6)) squad.splice(i, 1);
+}
+
+function sparkle(x, y, phase, col) {
+  if (phase > 24) return;
+  px(x, y, 1, 1, col);
+  if (phase > 5 && phase < 19) { px(x - 1, y, 1, 1, col); px(x + 1, y, 1, 1, col); px(x, y - 1, 1, 1, col); px(x, y + 1, 1, 1, col); }
+}
+
+// Clawd in a given pose. Feet rest on row 28 unless `top` places it (riding); flip = lying on its back.
+function drawClawd(x, o) {
+  const bh = o.bodyH, h = bh + 2;
+  const top = (o.top != null ? o.top : 29 - bh - (o.tuck ? 0 : 2)) - o.lift;
+  const P = (dx, dy, w, hh, col) => px(x + dx, o.flip ? top + h - dy - hh : top + dy, w, hh, col);
+  if (o.shadow) { const sh = Math.max(6, 12 - o.lift); px(x + 7 - sh / 2, 29, sh, 1, 'rgba(0,0,0,.45)'); }
+  // legs (outer light, inner dark), then body with a lit top edge and shaded right side
+  if (!o.tuck) [3, 5, 8, 10].forEach((lx, i) => { if (o.legs[i]) P(lx, bh, 1, o.legs[i], i % 3 ? CL.D : CL.O); });
+  P(2, 0, 10, bh, CL.O);
+  P(2, 0, 9, 1, CL.L);
+  P(11, 1, 1, bh - 1, CL.D);
+  // arms: side / low / up
+  [[0, o.armL], [12, o.armR]].forEach(([ax, st], i) => {
+    if (st === 'side') P(ax, 3, 2, 1, i ? CL.D : CL.O);
+    else if (st === 'low') P(ax, 4, 2, 1, i ? CL.D : CL.O);
+    else if (st === 'up') { P(i ? 12 : 1, 2, 1, 1, i ? CL.D : CL.O); P(i ? 13 : 0, 1, 1, 1, i ? CL.D : CL.O); }
+  });
+  // eyes
+  const e = o.eyes, k = CL.eye;
+  [4 + o.look, 9 + o.look].forEach((ex, i) => {
+    const s = i ? -1 : 1;
+    if (e === 'open') P(ex, 1, 1, 2, k);
+    else if (e === 'closed') P(ex - i, 2, 2, 1, k);
+    else if (e === 'happy') { P(ex - 1, 2, 1, 1, k); P(ex, 1, 1, 1, k); P(ex + 1, 2, 1, 1, k); }
+    else if (e === 'squint') { P(ex - s, 1, 1, 1, k); P(ex, 2, 1, 1, k); P(ex - s, 3, 1, 1, k); }
+    else if (e === 'x') { P(ex - 1, 1, 1, 1, k); P(ex + 1, 1, 1, 1, k); P(ex, 2, 1, 1, k); P(ex - 1, 3, 1, 1, k); P(ex + 1, 3, 1, 1, k); }
+  });
+  return top;
+}
+
+// One iron soldier, standing a row back (drawn before the heroes).
+function drawSoldier(s, m) {
+  const st = s.leaving || s.moving ? 'march' : m === 'ko' ? 'down' : pet.act === 'party' ? 'cheer'
+    : s.salute ? 'salute' : m === 'siege' || (ev && ev.type !== 'meteors') ? 'guard' : m === 'sleep' ? 'doze' : 'stand';
+  let x = s.x, lift = 0, dip = 0, eyes = 'open', look = s.look, spear = 0, walk = 0, alarm = false;
+  if (st === 'march') { walk = 1 + (f / 2 | 0) % 2; dip = (f / 2 | 0) % 2; look = s.dir; }
+  else if (st === 'cheer') { lift = Math.round(Math.abs(Math.sin((pet.t + s.id * 3) / 5)) * 3); spear = 3; eyes = 'happy'; }
+  else if (st === 'salute') { spear = 2; eyes = 'happy'; }
+  else if (st === 'guard') { look = -1; if (s.hit) x += 1; }
+  else if (st === 'doze') {                        // nods off on watch, then jolts awake
+    const ph = s.t % 120;
+    if (ph > 50 && ph < 84) { eyes = 'closed'; dip = ph > 62 ? 1 : 0; }
+    else if (ph >= 84 && ph < 98) { alarm = true; look = ph % 8 < 4 ? -1 : 1; }
+  } else if (st === 'down') eyes = 'x';
+  const down = st === 'down', top = 20 - lift + dip + (down ? 2 : 0);
+  px(x + 1, 29, 10, 1, 'rgba(0,0,0,.35)');
+  // spear: upright in the right hand, or dropped
+  if (down) { px(x - 1, 28, 14, 1, IR.wood); px(x + 13, 27, 1, 2, IR.tip); px(x + 14, 28, 1, 1, IR.tip); }
+  else {
+    const sx = x + 12, sy = 16 - lift - spear;
+    px(sx, sy, 1, 13, IR.wood);
+    px(sx, sy - 3, 1, 1, IR.tip); px(sx - 1, sy - 2, 3, 1, IR.tip); px(sx, sy - 1, 1, 1, IR.G);
+  }
+  // legs
+  if (!down) [[2, IR.L], [4, IR.D], [7, IR.D], [9, IR.L]].forEach(([lx, col], i) => {
+    const up = (walk === 1 && i % 2 === 0) || (walk === 2 && i % 2 === 1);
+    px(x + lx, 27 - lift, 1, up ? 1 : 2, col);
+  });
+  // body
+  SOL.forEach((r, ry) => { for (let i = 0; i < 12; i++) { const ch = r[i]; if (ch !== '.') px(x + i, top + ry, 1, 1, IR[ch]); } });
+  // eyes: two glowing slits in the visor
+  const ey = top + 4;
+  [x + 3 + look, x + 7 + look].forEach(ex => {
+    if (eyes === 'open') { c.globalAlpha = .22; px(ex - 1, ey - 1, 4, 3, IR.eye); c.globalAlpha = 1; px(ex, ey, 2, 1, IR.eye); }
+    else if (eyes === 'closed') px(ex, ey + 1, 2, 1, '#3d6a88');
+    else if (eyes === 'happy') { px(ex, ey + 1, 1, 1, IR.eye); px(ex + 1, ey, 1, 1, IR.eye); px(ex + 2, ey + 1, 1, 1, IR.eye); }
+    else if (eyes === 'x') { const g = '#8a86b8'; px(ex, ey - 1, 1, 1, g); px(ex + 2, ey - 1, 1, 1, g); px(ex + 1, ey, 1, 1, g); px(ex, ey + 1, 1, 1, g); px(ex + 2, ey + 1, 1, 1, g); }
+  });
+  // buckler: on the arm, raised against the storm, or lying on the floor
+  if (down) { px(x - 6, 27, 4, 1, IR.G); px(x - 6, 28, 4, 1, IR.D); px(x - 5, 27, 2, 1, IR.B); }
+  else {
+    const up = st === 'guard', gx = x - 3, gy = up ? top - 3 : top + 3, flash = up && s.hit > 1;   // held overhead in a siege
+    if (up) px(x - 1, top + 1, 1, 3, IR.D);
+    BUCK.forEach((r, ry) => { for (let i = 0; i < 4; i++) { const ch = r[i]; if (ch !== '.') px(gx + i, gy + ry, 1, 1, flash && ch !== 'B' ? '#ffffff' : IR[ch]); } });
+    if (up) shields.push({ x: gx, y: gy, w: 4, h: 4, who: s, raised: true });
+    if (m === 'siege') shields.push({ x, y: top, w: 12, h: 9, who: s });
+  }
+  if (alarm) { px(x + 5, top - 7, 2, 3, '#ffd166'); px(x + 5, top - 3, 2, 1, '#ffd166'); }
+  s.box = [x - 5, top - 7, 19, 29 - top + 7];
+}
+
+function draw(m, th) {
+  c.clearRect(0, 0, W, H);
+  const a = pet.act, t = pet.t, siege = m === 'siege';
+  const shake = ev && ev.type === 'quake' && ev.t < 58 ? (f % 2 ? 1 : -1) : 0;
+  c.save(); c.translate(shake, 0);
+  drawWorld(m);
+  if (siege) {                                 // the limit storm darkens everything
+    c.globalAlpha = .6; px(0, 0, W, 29, '#0d0a1e'); c.globalAlpha = 1;
+    const pulse = .75 + .25 * Math.sin(f / 9);
+    for (let r = 0; r < 9; r++) { c.globalAlpha = (.22 - r * .024) * pulse; px(0, r, W, 1, '#ff4d5e'); }
+    c.globalAlpha = 1;
+    [[0, 0, 15, 3], [7, 1, 17, 3], [18, 0, 12, 2], [2, 3, 10, 1], [15, 3, 7, 1]].forEach(r => px(r[0], r[1], r[2], r[3], '#2b1736'));
+    [[2, 0, 7, 1], [11, 1, 8, 1], [20, 0, 6, 1]].forEach(r => px(r[0], r[1], r[2], r[3], '#47264c'));
+    if (f % 97 < 2) { c.globalAlpha = .1; px(0, 0, W, H, '#ffd6dc'); c.globalAlpha = 1; }   // distant lightning
+  }
+  shields = [];
+
+  // back row: the iron guard; then any slimes in the front row
+  for (const s of squad) drawSoldier(s, m);
+  if (ev && ev.type === 'slimes') ev.slimes.forEach(drawSlime);
+
+  // ---- the guardian ----
+  let x = pet.x, lift = 0, squash = 0, eyes = 'open', look = 0, walkPh = 0, flutter = 0, capeDir = pet.dir;
+  let sword = 'hold', raise = 0, glint = -1, guard = false, swoosh = false;
+  const lv = usage ? level(Math.max(eff(usage.five_hour) || 0, (eff(usage.seven_day) || 0) - 10), 60, 80) : 'ok';
+  let eyeCol = EYE[lv];
+
+  if (a === 'idle') { squash = (f / 10 | 0) % 2; if (f % 45 < 2) eyes = 'closed'; }
+  else if (a === 'walk') { walkPh = 1 + (f / 2 | 0) % 2; lift = (f / 2 | 0) % 2; look = pet.dir; flutter = (f / 3 | 0) % 2; }
+  else if (a === 'look') { look = t < 12 ? -1 : 1; }
+  else if (a === 'hop') { lift = Math.round(Math.sin(t / 12 * Math.PI) * 5); eyes = 'happy'; }
+  else if (a === 'wave') { raise = t < 4 ? t : t > 20 ? 24 - t : 4; glint = t >= 4 && t <= 20 ? t - 4 : -1; eyes = 'happy'; }
+  else if (a === 'train') { raise = Math.round(Math.max(0, Math.sin(t / 6 * Math.PI)) * 5); swoosh = raise >= 4; if (t > 30) eyes = 'happy'; }
+  else if (a === 'munch') { if (t >= 12) eyes = 'happy'; }
+  else if (a === 'party') { lift = Math.round(Math.abs(Math.sin(t / 5)) * 6); eyes = 'happy'; raise = 4; glint = t % 16; flutter = (t / 3 | 0) % 2; }
+  else if (a === 'siege') {                    // shield up, braced, cape whipping in the wind
+    guard = true; eyes = 'worried'; look = -1; raise = 2; flutter = (f / 2 | 0) % 2; capeDir = -1;
+    if (pet.hit) { x += 1; eyeCol = '#ffb0b0'; }
+  }
+  else if (a === 'ko') { squash = 1; eyes = 'x'; sword = 'planted'; }
+  else if (a === 'sleep') { squash = (f / 16 | 0) % 2; eyes = 'closed'; eyeCol = '#3f7d62'; sword = 'planted'; }
+  if (ev && (a === 'idle' || a === 'walk')) {  // reacting to a random event
+    if (ev.type === 'quake') { eyes = 'worried'; squash = 0; }
+    else if (ev.type === 'dragon') { guard = true; eyes = 'worried'; look = 1; }
+    else if (ev.type === 'meteors') { look = -1; if (ev.t > 84) eyes = 'happy'; }
+    else if (ev.type === 'slimes') { look = -1; if (ev.bash) eyes = 'happy'; }
+  }
+
+  const rows = SPR.slice(); if (squash) rows.splice(8, 1);
+  const n = rows.length, top = 26 - n - lift, feet = top + n;
+
+  // shadow
+  const sh = Math.max(8, 16 - lift);
+  px(x + 9 - sh / 2, 29, sh, 1, 'rgba(0,0,0,.45)');
+  // cape (behind)
+  for (let r = 0; top + 6 + r <= feet + 2; r++) {
+    const y = top + 6 + r, sp = r / 2 | 0;
+    const l = x + 1 - sp - (flutter && capeDir > 0 ? 1 : 0), rr = x + 16 + sp + (flutter && capeDir < 0 ? 1 : 0);
+    px(l, y, rr - l + 1, 1, C.cape);
+    if (r > 1) { px(x + 5, y, 1, 1, C.capeD); px(x + 12, y, 1, 1, C.capeD); }
+  }
+  // legs (outer light, inner dark), walking lifts alternate pairs
+  [[3, C.legO], [6, C.legI], [10, C.legI], [13, C.legO]].forEach(([lx, col], i) => {
+    const up = (walkPh === 1 && i % 2 === 0) || (walkPh === 2 && i % 2 === 1);
+    px(x + lx, feet, 2, up ? 2 : 3, col);
+  });
+  // body
+  rows.forEach((r, ry) => { for (let i = 0; i < 18; i++) { const ch = r[i]; if (ch !== '.') px(x + i, top + ry, 1, 1, C[ch]); } });
+  // eyes in the visor
+  const ey = top + 5;
+  [x + 5 + look, x + 11 + look].forEach(ex => {
+    if (eyes === 'open') {
+      c.globalAlpha = .22; px(ex - 1, ey - 1, 4, 5, eyeCol); c.globalAlpha = 1;
+      px(ex, ey, 2, 3, eyeCol); px(ex, ey, 1, 1, '#ffffff');
+    }
+    else if (eyes === 'closed') px(ex, ey + 2, 2, 1, eyeCol);
+    else if (eyes === 'happy') { px(ex, ey + 2, 1, 1, eyeCol); px(ex + 1, ey + 1, 1, 1, eyeCol); px(ex + 2, ey + 2, 1, 1, eyeCol); }
+    else if (eyes === 'worried') px(ex, ey + 1, 2, 2, eyeCol);
+    else if (eyes === 'x') { const g = '#8a86b8'; px(ex, ey, 1, 1, g); px(ex + 2, ey, 1, 1, g); px(ex + 1, ey + 1, 1, 1, g); px(ex, ey + 2, 1, 1, g); px(ex + 2, ey + 2, 1, 1, g); }
+  });
+  // shield: on the left arm, or held high against the storm (flashes when struck)
+  const shx = (guard ? x - 7 : x - 5) - (ev && ev.bash > 4 ? 2 : 0), shy = guard ? top + 1 : top + 5, flash = guard && pet.hit > 1;
+  if (guard) px(x - 2, top + 3, 4, 1, C.D);   // arm up to the shield
+  SHIELD.forEach((r, ry) => { for (let i = 0; i < 5; i++) {
+    const ch = r[i]; if (ch !== '.') px(shx + i, shy + ry, 1, 1, ch === 'Y' ? (flash ? '#fff6c8' : C.G) : ch === 'N' ? C.navy : flash ? '#ffffff' : C.cyan); } });
+  if (guard) shields.push({ x: shx, y: shy, w: 5, h: 4, who: pet, raised: true });
+  if (siege) shields.push({ x: x - 3, y: top, w: 21, h: 29 - top, who: pet });   // his armour stops the rest
+  // sword (right arm)
+  if (sword === 'hold') {
+    const sx = x + 18, sy = top + 6 - raise;
+    c.globalAlpha = .15; px(sx - 1, sy - 11, 4, 11, C.edge); c.globalAlpha = 1;
+    px(sx, sy - 11, 1, 1, C.blade);
+    px(sx, sy - 10, 1, 10, C.blade); px(sx + 1, sy - 10, 1, 10, C.edge);
+    px(sx - 1, sy, 4, 1, C.G); px(sx, sy + 1, 2, 2, C.grip); px(sx, sy + 3, 2, 1, C.D);
+    if (glint >= 0 && glint < 10) px(sx, sy - 1 - glint, 2, 1, '#ffffff');
+    if (swoosh) { c.globalAlpha = .35; px(sx + 3, sy - 11, 1, 7, '#ffffff'); px(sx - 2, sy - 9, 1, 5, '#ffffff'); c.globalAlpha = 1; }
+  } else {
+    const sx = x + 20;
+    px(sx, 20, 2, 1, C.D); px(sx, 21, 2, 2, C.grip); px(sx - 1, 23, 4, 1, C.G);
+    px(sx, 24, 1, 5, C.blade); px(sx + 1, 24, 1, 5, C.edge);
+  }
+  pet.box = [x - 7, top - 13, 29, 29 - top + 13];
+
+  // ---- Clawd: clicked > riding > the guardian's big moments > the mood > its own antics ----
+  const pa = pal.act, pt = pal.t, riding = pa === 'ride';
+  const co = { lift: 0, eyes: 'open', look: 0, legs: [2, 2, 2, 2], armL: 'side', armR: 'side', flip: false, tuck: false, bodyH: 6, top: null, shadow: true };
+  let cx = pal.x, fly = null;
+  if (pal.moving) co.legs = (f / 2 | 0) % 2 ? [1, 2, 1, 2] : [2, 1, 2, 1];
+  if (riding) {                                // hops onto the guardian's helmet and rides along
+    const hx = x + 2, hTop = top - 3, k = 10;
+    co.shadow = false;
+    if (pt < k || pt >= pal.len - k) {
+      const up = pt < k, q = up ? pt / k : (pt - (pal.len - k)) / k;
+      const x0 = up ? pal.x : hx, x1 = up ? hx : pal.want, y0 = up ? 21 : hTop, y1 = up ? hTop : 21;
+      cx = Math.round(x0 + (x1 - x0) * q); co.top = Math.round(y0 + (y1 - y0) * q - Math.sin(q * Math.PI) * 6);
+      co.armL = co.armR = 'up'; co.eyes = 'happy';
+    } else {
+      cx = hx; co.top = hTop; co.tuck = true; co.look = [0, 1, 0, -1][(pt / 25 | 0) % 4];
+      if (['walk', 'hop', 'party', 'munch', 'wave', 'train'].includes(a)) co.eyes = 'happy';
+      if (a === 'walk') co.armL = co.armR = (f / 4 | 0) % 2 ? 'up' : 'side';
+    }
+  }
+  if (pal.yay) {                               // clicked: jumps for joy
+    const yt = 22 - pal.yay;
+    co.lift = Math.round(Math.sin(Math.min(yt, 14) / 14 * Math.PI) * 4); co.armL = co.armR = 'up'; co.eyes = 'happy';
+  } else if (riding) {
+  } else if (a === 'munch') {                  // catches its own token and chomps it
+    if (t >= 16 && t < 19) { co.bodyH = 5; co.eyes = 'closed'; }
+    else if (t >= 19) { co.eyes = 'happy'; co.lift = t < 25 ? Math.round(Math.sin((t - 19) / 6 * Math.PI) * 2) : 0; }
+  } else if (a === 'party') {
+    co.lift = Math.round(Math.abs(Math.cos(t / 5)) * 4); co.eyes = 'happy';
+    const up = (t / 4 | 0) % 2; co.armL = up ? 'up' : 'side'; co.armR = up ? 'side' : 'up';
+  } else if (a === 'wave') {                   // waves along with the salute
+    co.eyes = 'happy'; co.armR = t >= 3 && t <= 21 && (t / 3 | 0) % 2 ? 'up' : 'side';
+  } else if (a === 'hop') {
+    const tt = t - 3; if (tt >= 0 && tt < 12) co.lift = Math.round(Math.sin(tt / 12 * Math.PI) * 3);
+  } else if (a === 'look') {                   // checks the other way
+    co.look = t < 12 ? 1 : -1;
+  } else if (a === 'train') {                  // watches the sword drill, then cheers
+    co.look = -1; if (t > 30) { co.eyes = 'happy'; co.armL = co.armR = 'up'; }
+  } else if (a === 'siege') {                  // huddles behind the guardian
+    co.bodyH = 5;
+    if (pal.flinch) { co.eyes = 'squint'; co.armL = co.armR = 'up'; cx += pal.flinch % 2; }
+    else { co.look = -1; co.armL = co.armR = 'low'; if ((f + 9) % 47 < 2) co.eyes = 'closed'; }
+  } else if (siege) {                          // scurrying into cover
+    co.eyes = 'squint'; co.armL = co.armR = 'up';
+  } else if (a === 'ko') {                     // flipped over, legs kicking
+    co.flip = true; co.eyes = 'x'; co.legs = (f / 3 | 0) % 2 ? [2, 1, 2, 1] : [1, 2, 1, 2];
+  } else if (a === 'sleep') {                  // curled up beside the sword
+    co.tuck = true; co.eyes = 'closed'; co.bodyH = ((f + 8) / 16 | 0) % 2 ? 5 : 6;
+  } else if (ev && ev.type === 'quake') {      // wobbling, claws up
+    co.eyes = 'squint'; co.armL = co.armR = 'up'; co.lift = f % 4 < 2 ? 1 : 0;
+  } else if (ev && ev.type === 'dragon') {     // ducks low and peeks at it
+    co.bodyH = 5; co.look = 1; co.eyes = ev.t % 30 < 20 ? 'squint' : 'open';
+  } else if (ev && ev.type === 'meteors') {    // watches the shower, cheers the big one
+    co.look = -1; if (ev.t > 84) { co.eyes = 'happy'; co.armL = co.armR = 'up'; }
+  } else if (ev && ev.type === 'slimes' && !ev.won) {   // hides until the slimes are gone
+    co.bodyH = 5; co.eyes = 'squint'; co.armL = co.armR = 'up';
+  } else if (pa === 'peek') {                  // glances over at the knight
+    co.look = -1; if (pt > 11 && pt < 14) co.eyes = 'closed';
+  } else if (pa === 'hop') {
+    co.lift = Math.round(Math.sin(pt / 12 * Math.PI) * 3);
+  } else if (pa === 'code') {                  // types away, Claude Code style
+    const k = (pt / 2 | 0) % 2; co.armL = k ? 'side' : 'low'; co.armR = k ? 'low' : 'side';
+    if (pt > 36) co.eyes = 'happy';
+  } else if (pa === 'juggle') {                // tosses a token
+    const ph = pt % 16; co.armL = co.armR = ph < 3 || ph > 13 ? 'up' : 'side'; if (pt > 40) co.eyes = 'happy';
+  } else if (pa === 'dance') {                 // crab shuffle
+    cx += Math.round(Math.sin(pt / 4) * 2); co.legs = (pt / 2 | 0) % 2 ? [1, 2, 1, 2] : [2, 1, 2, 1];
+    const up = (pt / 5 | 0) % 2; co.armL = up ? 'up' : 'side'; co.armR = up ? 'side' : 'up'; co.eyes = 'happy'; co.lift = up;
+  } else if (pa === 'bubble') {                // blows a bubble and watches it float off
+    co.look = 1; if (pt < 10) co.eyes = 'closed'; else if (pt > 44) co.eyes = 'happy';
+  } else if (pa === 'firefly') {               // follows a firefly, pounces, misses
+    fly = [cx + 7 + Math.cos(pt / 7) * 9, 15 + Math.sin(pt / 4) * 3 - (pt > 56 ? (pt - 56) * 1.5 : 0)];
+    co.look = fly[0] < cx + 6 ? -1 : fly[0] > cx + 8 ? 1 : 0;
+    if (pt >= 48 && pt < 58) { co.lift = Math.round(Math.sin((pt - 48) / 10 * Math.PI) * 4); co.armL = co.armR = 'up'; }
+  } else {
+    if ((f + 23) % 61 < 2) co.eyes = 'closed';
+    if (!pal.moving && (f / 14 | 0) % 2) co.armL = co.armR = 'low';
+  }
+  const ctop = drawClawd(cx, co);
+  pal.box = [cx - 1, ctop - 2, 16, 11];
+
+  // ---- the storm: limit bolts rain from the upper left; most hit a shield, none can reach Clawd ----
+  if (a === 'siege' && f % (th >= 3 ? 4 : 6) === 0) {
+    // only aim at shields on the storm side of the guardian, so a stray bolt can't fall onto Clawd
+    const up = shields.filter(s => s.raised && s.x < pet.x), tg = up.length && Math.random() < .75 ? up[rnd(up.length)] : null;
+    const tx = tg ? tg.x + rnd(tg.w) : rnd(Math.max(1, x - 8)), ty = tg ? tg.y + rnd(tg.h) : 28;
+    bolts.push({ x: tx - (ty + 3) * .5, y: -3 });
+  }
+  for (let i = bolts.length - 1; i >= 0; i--) {
+    const b = bolts[i]; b.x += .5; b.y += 1;
+    const hit = shields.find(s => b.x >= s.x && b.x < s.x + s.w && b.y >= s.y && b.y < s.y + s.h);
+    if (hit || b.y >= 28) {
+      for (let k = 0; k < (hit ? 5 : 2); k++)
+        sparks.push({ x: b.x, y: b.y, vx: (Math.random() - .65) * 1.6, vy: -Math.random() * 1.4, life: 6 + rnd(5), ground: !hit });
+      if (hit) { hit.who.hit = 3; if (hit.x > pet.x - 10) pal.flinch = 6; }
+      bolts.splice(i, 1); continue;
+    }
+    c.globalAlpha = .45; px(b.x - 1, b.y - 2, 1, 1, '#a8324a'); c.globalAlpha = 1;
+    px(b.x - .5, b.y - 1, 1, 1, '#e0505e'); px(b.x, b.y, 1, 1, '#ffb3a8');
+  }
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const p = sparks[i]; p.x += p.vx; p.y += p.vy; p.vy += .2;
+    if (--p.life <= 0) { sparks.splice(i, 1); continue; }
+    px(p.x, p.y, 1, 1, p.col ? p.col : p.ground ?(p.life > 4 ? '#ff8a6a' : '#7a3a4a') : p.life > 7 ? '#ffffff' : p.life > 4 ? '#ffd166' : '#e8916f');
+  }
+
+  // ---- effects ----
+  if (a === 'munch' && t < 12) {               // a gold token drops onto its crown
+    const cy = 1 + (top - 4) * t / 11;
+    px(x + 8, cy, 3, 3, '#ffd166'); px(x + 8, cy, 1, 1, '#fff3b0'); px(x + 10, cy + 2, 1, 1, '#d99a1e');
+  }
+  if (a === 'munch' && t >= 12) {
+    const p = (t - 12) * 2;
+    sparkle(x + 2, top - 1, p, '#ffd166'); sparkle(x + 16, top + 1, p + 6, '#ffd166'); sparkle(x + 9, top - 3, p + 3, '#fff3b0');
+  }
+  if (a === 'munch' && t >= 4 && t < 16) {     // a second, smaller token for Clawd
+    const ty = 1 + (ctop - 3) * (t - 4) / 11;
+    px(cx + 6, ty, 2, 2, '#ffd166'); px(cx + 6, ty, 1, 1, '#fff3b0');
+  }
+  if (a === 'munch' && t >= 19) {
+    const p = (t - 19) * 2;
+    sparkle(cx + 1, ctop, p, '#e8916f'); sparkle(cx + 13, ctop - 2, p + 4, '#ffd166');
+  }
+  if (pal.yay && pal.yay > 4) {                // a little heart floats up
+    const yt = 22 - pal.yay, hy = ctop - 3 - yt / 3, hx = cx + 6;
+    c.globalAlpha = Math.min(1, (pal.yay - 4) / 6);
+    px(hx, hy, 1, 1, '#ff7f8e'); px(hx + 2, hy, 1, 1, '#ff7f8e'); px(hx, hy + 1, 3, 1, '#ff7f8e'); px(hx + 1, hy + 2, 1, 1, '#ff7f8e');
+    c.globalAlpha = 1;
+  }
+  if (pa === 'code' && !pal.yay) {             // a tiny terminal: prompt, typing, then a green tick
+    const bx = cx + 1, by = ctop - 9;
+    px(bx, by, 12, 7, '#3d3a66'); px(bx + 1, by + 1, 10, 5, '#0b0c20'); px(bx + 5, by + 7, 2, 1, '#3d3a66');
+    px(bx + 2, by + 2, 1, 1, CL.O); px(bx + 3, by + 3, 1, 1, CL.O); px(bx + 2, by + 4, 1, 1, CL.O);
+    if (pt > 36) { [[5, 3], [6, 4], [7, 3], [8, 2]].forEach(([dx, dy]) => px(bx + dx, by + dy, 1, 1, '#6fdca0')); }
+    else {
+      const nch = Math.min(4, pt / 7 | 0);
+      for (let k = 0; k < nch; k++) px(bx + 5 + k, by + 3, 1, 1, ['#9a94c9', '#e9e6ff', '#7ee0c3', '#ffc857'][k]);
+      if ((f / 4 | 0) % 2) px(bx + 5 + nch, by + 2, 1, 3, '#e9e6ff');
+    }
+  }
+  if (pa === 'juggle' && pt < 46 && !pal.yay) {
+    const ph = pt % 16, ty = ctop - 3 - Math.sin(ph / 16 * Math.PI) * 8;
+    px(cx + 6, ty, 2, 2, '#ffd166'); px(cx + 6, ty, 1, 1, '#fff3b0');
+  }
+  if (pa === 'dance') for (let k = 0; k < 2; k++) {   // music notes drift up
+    const nt = (pt + k * 13) % 26, nx = cx + 2 + k * 8 + Math.sin(nt / 4), ny = ctop - 3 - nt * .45;
+    c.globalAlpha = 1 - nt / 26; const col = k ? '#ffd166' : '#e8916f';
+    px(nx + 1, ny, 1, 3, col); px(nx, ny + 2, 1, 1, col); px(nx + 2, ny, 1, 1, col);
+    c.globalAlpha = 1;
+  }
+  if (pa === 'bubble' && pt >= 10) {
+    const q = pt - 10, bx = cx + 14 + q * .15 + Math.sin(q / 4), by = ctop + 2 - q * .45;
+    c.globalAlpha = .85;
+    if (pt < 46 && q < 8) { px(bx - 1, by, 1, 1, '#9fd3ff'); px(bx + 1, by, 1, 1, '#9fd3ff'); px(bx, by - 1, 1, 1, '#9fd3ff'); px(bx, by + 1, 1, 1, '#9fd3ff'); }
+    else if (pt < 46) {
+      px(bx - 1, by - 2, 3, 1, '#9fd3ff'); px(bx - 1, by + 2, 3, 1, '#9fd3ff'); px(bx - 2, by - 1, 1, 3, '#9fd3ff'); px(bx + 2, by - 1, 1, 3, '#9fd3ff');
+      px(bx - 1, by - 1, 1, 1, '#ffffff');
+    } else if (pt < 50) [[-3, -3], [3, -3], [-3, 3], [3, 3]].forEach(([dx, dy]) => px(bx + dx, by + dy, 1, 1, '#9fd3ff'));
+    c.globalAlpha = 1;
+  }
+  if (fly && fly[1] > -2) {                    // the firefly, its glow pulsing
+    c.globalAlpha = (f / 3 | 0) % 3 ? .45 : .15; px(fly[0] - 1, fly[1] - 1, 3, 3, '#d9ff7a'); c.globalAlpha = 1;
+    px(fly[0], fly[1], 1, 1, '#f4ffb0');
+  }
+  if (a === 'ko') for (let k = 0; k < 3; k++) {
+    const an = f / 5 + k * 2.09;
+    px(x + 9 + Math.cos(an) * 8, top - 3 + Math.sin(an) * 2, 1, 1, Math.sin(an) > 0 ? '#ffd166' : '#8a6d2b');
+  }
+  if (a === 'sleep') for (let k = 0; k < 2; k++) {
+    const ph = (f / 4 + k * 9) % 18, zx = x + 12 + ph / 3, zy = top - 2 - ph * .7;
+    if (zy < 0) continue;
+    c.globalAlpha = 1 - ph / 18;
+    px(zx, zy, 3, 1, '#b8b2ee'); px(zx + 1, zy + 1, 1, 1, '#b8b2ee'); px(zx, zy + 2, 3, 1, '#b8b2ee');
+    c.globalAlpha = 1;
+  }
+  if (a === 'party') for (let i = 0; i < 18; i++) {
+    const qx = (i * 11 + 3 + Math.sin(t / 4 + i) * 2) % W, qy = (i * 5 + t * (1 + i % 3) * .6) % 29;
+    px(qx, qy, 1, i % 2 + 1, ['#ffd166', '#62e6f0', '#6fdca0', '#f2f8ff'][i % 4]);
+  }
+  if (ev && ev.bash > 4) sparkle(x - 10, top + 6, 10, '#ffffff');   // bonk!
+  // weather in front of everything
+  if (weather === 'rain') {
+    c.globalAlpha = .55;
+    for (let i = 0; i < 16; i++) { const ry = (i * 11 + f * 2.6) % 31; px((i * 13 + ry * .4) % (W + 6) - 3, ry, 1, 2, '#8fb0e8'); }
+    c.globalAlpha = 1;
+  } else if (weather === 'snow') {
+    c.globalAlpha = .85;
+    for (let i = 0; i < 18; i++) { const sy = (i * 7 + f * .35 + i * 3) % 30; px((i * 17 + Math.sin(f / 9 + i) * 2 + f * .1) % W, sy, 1, 1, '#eef0ff'); }
+    c.globalAlpha = 1;
+  }
+  c.restore();
+}
+
+// ---------- wiring ----------
+function setUsage(d) { usage = d; refresh(); }
+setInterval(step, 100);
+setInterval(refresh, 30000);
+refresh(); draw(mood(), threat());
+
+if (new URLSearchParams(location.search).has('demo') || !window.widget) {
+  // cycles through every mood so you can see all the animations
+  const now = () => Date.now() / 1000;
+  const frames = [[12, 31], [19, 32], [41, 35], [58, 38], [67, 40], [84, 44], [93, 47], [100, 52], [0, 52], [6, 53], null];
+  let i = 0;
+  const next = () => {
+    const fr = frames[i++ % frames.length];
+    setUsage(fr ? { five_hour: { used_percentage: fr[0], resets_at: now() + 8040 }, seven_day: { used_percentage: fr[1], resets_at: now() + 273600 }, updated_at: Date.now(), source: 'demo' } : null);
+  };
+  next(); setInterval(next, 8000);
+} else {
+  window.widget.onUsage(setUsage);
+  if (window.widget.onDiag) window.widget.onDiag(d => { diag = d; refresh(); });
+  if (window.widget.onEvent) window.widget.onEvent(() => { if (!ev) startEvent(); });
+  window.widget.ready();
+}
+</script>
+</body>
+</html>
